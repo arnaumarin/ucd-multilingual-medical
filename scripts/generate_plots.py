@@ -438,18 +438,30 @@ def main():
         results, energy_records = make_simulated_results(languages, methods)
         results_by_subject = make_simulated_subject_results(languages, methods, subjects)
     else:
-        res_file = Path(args.results_dir) / f"results_{args.model_size}_n{args.n_samples}.json"
-        with open(res_file) as f:
-            data = json.load(f)
-        results = data["results"]
+        # Load summary (per-language accuracies)
+        summary_file = Path(args.results_dir) / f"summary_{args.model_size}_n{args.n_samples}.json"
+        with open(summary_file) as f:
+            results = json.load(f)
+        # Wrap to match expected format {lang: {method: {accuracy: float}}}
+        for lang in results:
+            for method in results[lang]:
+                if not isinstance(results[lang][method], dict):
+                    results[lang][method] = {"accuracy": results[lang][method]}
 
-        energy_file = Path(args.results_dir) / f"energies_{args.model_size}_n{args.n_samples}.json"
-        with open(energy_file) as f:
-            energy_records = json.load(f)
+        # Load per-item records for energy distributions
+        records_file = Path(args.results_dir) / f"records_{args.model_size}_n{args.n_samples}.json"
+        with open(records_file) as f:
+            raw_records = json.load(f)
+        energy_records = [
+            {"lang": r["lang"], "exp": r["exp_energy"], "base": r["base_energy"],
+             "correct": r["ucd_ok"], "method": "ucd"}
+            for r in raw_records
+        ]
 
-        # Per-subject breakdown requires subject-level energy records
-        # (populated if run_experiment.py was run with subject tracking)
-        results_by_subject = make_simulated_subject_results(languages, methods, subjects)
+        # Load per-subject breakdown
+        breakdown_file = Path(args.results_dir) / f"breakdown_{args.model_size}_n{args.n_samples}.json"
+        with open(breakdown_file) as f:
+            results_by_subject = json.load(f)
 
     print("\nGenerating plots...")
     plot_accuracy_bars(results, languages, methods, out_dir)

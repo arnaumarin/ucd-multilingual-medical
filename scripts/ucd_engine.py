@@ -54,23 +54,34 @@ def compute_logit_trace(
     2. Logit trace l_T accumulated over all question tokens (eq. 2 from paper)
 
     Returns (final_logits, logit_trace_scalar)
+
+    Vectorised: gathers selected-token logits for all positions in one shot,
+    then computes the discounted sum on-device — single GPU→CPU sync total.
     """
-    input_ids = input_ids.to(next(model.parameters()).device)
+    device = next(model.parameters()).device
+    input_ids = input_ids.to(device)
+
     with torch.no_grad():
         outputs = model(input_ids, output_hidden_states=False)
-        all_logits = outputs.logits  # [1, seq_len, vocab_size]
+        all_logits = outputs.logits  # [1, seq_len, vocab]
 
-    seq_len = all_logits.shape[1]
+    # Gather logit of the actual next token at each position: z_k[x_{k+1}]
+    # next_token_ids: [seq_len-1]  →  selected_logits: [seq_len-1]
+    next_token_ids = input_ids[0, 1:].unsqueeze(1)                        # [T, 1]
+    selected_logits = all_logits[0, :-1].gather(1, next_token_ids).squeeze(1)  # [T]
 
-    # Build cumulative logit trace over the sequence (eq. 2)
-    # l_t = beta * l_{t-1} + z_t[x_t]  where x_t is the actual token at position t
-    logit_trace = 0.0
-    for k in range(seq_len - 1):
-        token_id = input_ids[0, k + 1].item()   # token selected at step k+1
-        token_logit = all_logits[0, k, token_id].item()
-        logit_trace = beta * logit_trace + token_logit
+    # Discounted sum: l = Σ_{k=0}^{T-1} β^{T-1-k} · selected_logits[k]
+    T = selected_logits.shape[0]
+    if beta == 1.0:
+        logit_trace = selected_logits.sum().item()   # single sync
+    else:
+        powers = torch.pow(
+            torch.tensor(beta, dtype=selected_logits.dtype, device=device),
+            torch.arange(T - 1, -1, -1, device=device, dtype=selected_logits.dtype),
+        )
+        logit_trace = (powers * selected_logits).sum().item()  # single sync
 
-    final_logits = all_logits[0, -1, :]  # logits at answer position
+    final_logits = all_logits[0, -1]  # logits at answer position [vocab]
     return final_logits, logit_trace
 
 
