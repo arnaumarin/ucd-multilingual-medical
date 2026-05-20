@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+env/
+
+# Large result files (keep summary JSONs, ignore per-item records)
+results/records_*.json
+results/energies_*.json
+
+# Model cache
+models/
+*.bin
+*.safetensors
+
+# Raw data downloads
+data/
+
+# HuggingFace cache
+~/.cache/huggingface/
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/

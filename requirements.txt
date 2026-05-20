@@ -1,0 +1,19 @@
+# Core ML
+torch>=2.2.0
+transformers>=4.40.0
+accelerate>=0.27.0
+sentencepiece>=0.1.99
+protobuf>=4.25.0
+
+# Datasets
+datasets>=2.18.0
+
+# Analysis & plotting
+numpy>=1.26.0
+pandas>=2.2.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+scipy>=1.12.0
+
+# Utilities
+tqdm>=4.66.0

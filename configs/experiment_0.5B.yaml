@@ -1,0 +1,40 @@
+# Reproducibility config — Qwen2.5-0.5B small-scale run
+# Run with: python scripts/run_fast.py  (reads this config automatically)
+
+models:
+  expert: "Qwen/Qwen2.5-0.5B-Instruct"
+  base:   "Qwen/Qwen2.5-0.5B"
+
+ucd:
+  beta:        1.0    # logit trace discount factor (β)
+  temperature: 1.0    # energy temperature (T)
+  alpha:       1.0    # expert scaling factor
+
+dataset:
+  name:        "openai/MMMLU"
+  en_source:   "cais/mmlu"
+  n_samples:   150    # per language, stratified across subjects
+  subjects:
+    - clinical_knowledge
+    - medical_genetics
+    - anatomy
+    - professional_medicine
+    - college_medicine
+    - college_biology
+    - high_school_biology
+    - nutrition
+    - virology
+
+languages:
+  en: "default"     # original English MMLU (cais/mmlu)
+  zh: "ZH_CN"
+  es: "ES_LA"
+  fr: "FR_FR"
+  de: "DE_DE"
+  ar: "AR_XY"
+  ko: "KO_KR"
+  ja: "JA_JP"
+
+output:
+  results_dir: "results/"
+  plots_dir:   "plots/"

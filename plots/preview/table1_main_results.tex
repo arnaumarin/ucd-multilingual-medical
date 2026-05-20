@@ -1,0 +1,22 @@
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Language & Greedy & CD & UCD (ours) \\
+\midrule
+English & 56.3 & 58.0 & \textbf{62.8} \\
+Chinese & 42.2 & 46.8 & \textbf{49.3} \\
+Spanish & 49.6 & 51.9 & \textbf{58.0} \\
+French & 47.4 & 52.3 & \textbf{57.5} \\
+German & 49.0 & 50.0 & \textbf{57.2} \\
+Arabic & 34.6 & 38.2 & \textbf{47.1} \\
+Korean & 44.0 & 44.0 & \textbf{51.2} \\
+Japanese & 42.1 & 43.6 & \textbf{53.4} \\
+\midrule
+\textbf{Average} & 45.6 & 48.1 & \textbf{54.6} \\
+\bottomrule
+\end{tabular}
+\caption{Accuracy (\%) on MMMLU-Medical across 8 languages. UCD consistently outperforms greedy decoding and standard CD.}
+\label{tab:mmmlu_medical_main}
+\end{table}
