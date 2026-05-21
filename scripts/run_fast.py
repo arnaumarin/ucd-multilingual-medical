@@ -14,10 +14,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent))
 from ucd_engine import (
-    UCDConfig, format_mc_prompt,
-    compute_logit_trace, compute_energy, ucd_score, get_answer_token_ids,
+    UCDConfig, format_mc_prompt, evaluate_mc_sample, get_answer_token_ids,
     ANSWER_CHOICES,
 )
+
+
+def pick_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 # ── Config ──────────────────────────────────────────────────────────────────
 MEDICAL_SUBJECTS = [
@@ -41,7 +48,10 @@ N_SAMPLES  = 150      # per language (stratified across subjects)
 MODEL_EXP  = "Qwen/Qwen2.5-0.5B-Instruct"
 MODEL_BASE = "Qwen/Qwen2.5-0.5B"
 OUT_DIR    = Path(__file__).parents[1] / "results"
-DEVICE     = "mps" if torch.backends.mps.is_available() else "cpu"
+DEVICE     = pick_device()
+# fp32 on CPU/MPS for stability; bf16 on CUDA for speed (logit math is re-cast
+# to fp32 inside the engine regardless).
+DTYPE      = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
 
 # ── Dataset helpers ──────────────────────────────────────────────────────────
@@ -86,67 +96,59 @@ def load_samples(lang_code, mmmlu_config, n):
 
 # ── Core per-sample evaluation ───────────────────────────────────────────────
 def evaluate_sample(expert, base, tokenizer, item, config, answer_ids):
-    prompt    = format_mc_prompt(item["question"], item["choices"], item["lang"])
-    input_ids = tokenizer.encode(prompt, return_tensors="pt")
-
-    # Single forward pass each
-    exp_logits, exp_trace = compute_logit_trace(expert, tokenizer, input_ids,
-                                                config.beta, config.temperature)
-    base_logits, base_trace = compute_logit_trace(base, tokenizer, input_ids,
-                                                  config.beta, config.temperature)
-
-    exp_energy  = compute_energy(exp_logits,  exp_trace,  config.temperature)
-    base_energy = compute_energy(base_logits, base_trace, config.temperature)
-
-    # UCD logits
-    ucd_logits = ucd_score(exp_logits, base_logits, exp_energy, base_energy, alpha=1.0)
-
-    # CD logits (static equal weighting)
-    cd_logits = 2 * exp_logits - base_logits
-
-    gold = item["answer"]
-
-    def pick(logit_vec):
-        scores = {ch: logit_vec[tid].item() for ch, tid in answer_ids.items()}
-        return max(scores, key=scores.get), scores
-
-    greedy_pred, greedy_scores = pick(exp_logits)
-    cd_pred,     cd_scores     = pick(cd_logits)
-    ucd_pred,    ucd_scores    = pick(ucd_logits)
-
+    """Thin wrapper over the shared engine core; adds lang/subject + rounds."""
+    prompt = format_mc_prompt(item["question"], item["choices"], item["lang"])
+    r = evaluate_mc_sample(expert, base, tokenizer, prompt,
+                           item["answer"], config, answer_ids)
     return {
         "lang":         item["lang"],
         "subject":      item["subject"],
-        "gold":         gold,
-        "greedy_pred":  greedy_pred,
-        "cd_pred":      cd_pred,
-        "ucd_pred":     ucd_pred,
-        "greedy_ok":    greedy_pred == gold,
-        "cd_ok":        cd_pred     == gold,
-        "ucd_ok":       ucd_pred    == gold,
-        "exp_energy":   round(exp_energy,  4),
-        "base_energy":  round(base_energy, 4),
-        "exp_trace":    round(float(exp_trace),  4),
-        "base_trace":   round(float(base_trace), 4),
-        "greedy_scores": {k: round(v,4) for k,v in greedy_scores.items()},
-        "ucd_scores":    {k: round(v,4) for k,v in ucd_scores.items()},
+        "gold":         r["gold"],
+        "greedy_pred":  r["greedy_pred"],
+        "cd_pred":      r["cd_pred"],
+        "ucd_pred":     r["ucd_pred"],
+        "greedy_ok":    r["greedy_ok"],
+        "cd_ok":        r["cd_ok"],
+        "ucd_ok":       r["ucd_ok"],
+        "exp_energy":   round(r["exp_energy"],  4),
+        "base_energy":  round(r["base_energy"], 4),
+        "exp_trace":    round(r["exp_trace"],   4),
+        "base_trace":   round(r["base_trace"],  4),
+        "answer_form":  r["answer_form"],
+        "greedy_scores": {k: round(v, 4) for k, v in r["greedy_scores"].items()},
+        "ucd_scores":    {k: round(v, 4) for k, v in r["ucd_scores"].items()},
     }
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
+def parse_args():
+    import argparse
+    p = argparse.ArgumentParser(description="Fast UCD multilingual-medical runner.")
+    p.add_argument("--expert", default=MODEL_EXP, help="Expert (instruct) model id.")
+    p.add_argument("--base", default=MODEL_BASE, help="Base (amateur) model id.")
+    p.add_argument("--tag", default="0.5B",
+                   help="Output tag → records_<tag>_n<N>.json / summary_<tag>_n<N>.json")
+    p.add_argument("--n", type=int, default=N_SAMPLES, help="Samples per language.")
+    p.add_argument("--languages", nargs="+", default=list(LANGUAGES.keys()))
+    p.add_argument("--beta", type=float, default=1.0)
+    p.add_argument("--temperature", type=float, default=1.0)
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    config = UCDConfig()
+    config = UCDConfig(beta=args.beta, temperature=args.temperature)
 
-    print(f"Device: {DEVICE}")
-    print(f"Loading expert  : {MODEL_EXP}")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_EXP)
+    print(f"Device: {DEVICE} | dtype: {DTYPE}")
+    print(f"Loading expert  : {args.expert}")
+    tokenizer = AutoTokenizer.from_pretrained(args.expert)
     expert    = AutoModelForCausalLM.from_pretrained(
-        MODEL_EXP, dtype=torch.float32, device_map=DEVICE).eval()
+        args.expert, dtype=DTYPE, device_map=DEVICE).eval()
 
-    print(f"Loading base    : {MODEL_BASE}")
+    print(f"Loading base    : {args.base}")
     base = AutoModelForCausalLM.from_pretrained(
-        MODEL_BASE, dtype=torch.float32, device_map=DEVICE).eval()
+        args.base, dtype=DTYPE, device_map=DEVICE).eval()
 
     answer_ids = get_answer_token_ids(tokenizer)
     print(f"Answer token IDs: {answer_ids}\n")
@@ -154,9 +156,10 @@ def main():
     all_records = []
     summary = {}
 
-    for lang_code, mmmlu_cfg in LANGUAGES.items():
+    for lang_code in args.languages:
+        mmmlu_cfg = LANGUAGES[lang_code]
         print(f"[{lang_code.upper()}] Loading {mmmlu_cfg}...")
-        samples = load_samples(lang_code, mmmlu_cfg, N_SAMPLES)
+        samples = load_samples(lang_code, mmmlu_cfg, args.n)
         print(f"  {len(samples)} samples | running inference...")
 
         lang_records = []
@@ -179,14 +182,14 @@ def main():
         print(f"  [{lang_code}] {acc_str}  ({elapsed:.1f}s)")
 
     # Save
-    records_path = OUT_DIR / "records_0.5B_n150.json"
+    records_path = OUT_DIR / f"records_{args.tag}_n{args.n}.json"
     with open(records_path, "w") as f:
         json.dump(all_records, f)
     print(f"\nRecords saved → {records_path}")
 
-    summary_path = OUT_DIR / "summary_0.5B_n150.json"
+    summary_path = OUT_DIR / f"summary_{args.tag}_n{args.n}.json"
     with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump({"expert": args.expert, "base": args.base, "summary": summary}, f, indent=2)
     print(f"Summary saved  → {summary_path}")
 
     # Print table

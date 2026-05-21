@@ -392,6 +392,59 @@ def generate_latex_table(results, languages, methods, output_dir):
 # Simulated subject-level data
 # ---------------------------------------------------------------------------
 
+def load_from_records(records, methods):
+    """Build (results, energy_records) from run_fast.py per-item records — the
+    richest output (per-item lang/subject/energies/correctness for every method).
+    Returns results[lang][method]={accuracy,total} and a flat energy_records list."""
+    langs = sorted({r["lang"] for r in records})
+    results, energy_records = {}, []
+    for lang in langs:
+        rows = [r for r in records if r["lang"] == lang]
+        n = len(rows)
+        results[lang] = {
+            m: {"accuracy": sum(int(r[f"{m}_ok"]) for r in rows) / n if n else 0.0,
+                "total": n}
+            for m in methods
+        }
+        for r in rows:
+            for m in methods:
+                energy_records.append({
+                    "exp": r["exp_energy"], "base": r["base_energy"],
+                    "lang": lang, "subject": r["subject"],
+                    "correct": r[f"{m}_ok"], "method": m,
+                })
+    return results, energy_records
+
+
+def compute_subject_results(energy_records, languages, methods, subjects):
+    """Build results_by_subject[lang][subject][method] = {"accuracy": acc} from
+    the per-sample energy records written by the runners. Each record carries its
+    language, subject, method, and per-method correctness, so we can recover real
+    per-subject accuracy instead of simulating it. Returns None if the records
+    lack the needed fields (older runs)."""
+    if not energy_records or not all(
+        k in energy_records[0] for k in ("lang", "subject", "method", "correct")
+    ):
+        return None
+
+    counts: dict = {}
+    for r in energy_records:
+        key = (r["lang"], r["subject"], r["method"])
+        c, t = counts.get(key, (0, 0))
+        counts[key] = (c + int(bool(r["correct"])), t + 1)
+
+    out = {}
+    for lang in languages:
+        out[lang] = {}
+        for subj in subjects:
+            out[lang][subj] = {}
+            for m in methods:
+                c, t = counts.get((lang, subj, m), (0, 0))
+                if t > 0:
+                    out[lang][subj][m] = {"accuracy": c / t}
+    return out
+
+
 def make_simulated_subject_results(languages, methods, subjects):
     rng = np.random.default_rng(99)
     results = {}
@@ -438,18 +491,36 @@ def main():
         results, energy_records = make_simulated_results(languages, methods)
         results_by_subject = make_simulated_subject_results(languages, methods, subjects)
     else:
+        records_file = Path(args.results_dir) / f"records_{args.model_size}_n{args.n_samples}.json"
         res_file = Path(args.results_dir) / f"results_{args.model_size}_n{args.n_samples}.json"
-        with open(res_file) as f:
-            data = json.load(f)
-        results = data["results"]
+        if records_file.exists():
+            # run_fast.py output (preferred): derive everything from per-item records.
+            print(f"Loading per-item records: {records_file}")
+            with open(records_file) as f:
+                records = json.load(f)
+            results, energy_records = load_from_records(records, methods)
+        else:
+            # run_experiment.py output: separate results + energies files.
+            with open(res_file) as f:
+                results = json.load(f)["results"]
+            energy_file = Path(args.results_dir) / f"energies_{args.model_size}_n{args.n_samples}.json"
+            with open(energy_file) as f:
+                energy_records = json.load(f)
 
-        energy_file = Path(args.results_dir) / f"energies_{args.model_size}_n{args.n_samples}.json"
-        with open(energy_file) as f:
-            energy_records = json.load(f)
+        # Real per-subject accuracy from the energy records; fall back to
+        # simulated only if the records predate subject/method tracking.
+        results_by_subject = compute_subject_results(
+            energy_records, languages, methods, subjects)
+        if results_by_subject is None:
+            print("  [warn] energy records lack subject/method fields — "
+                  "figs 4 & 5 will use SIMULATED subject data.")
+            results_by_subject = make_simulated_subject_results(
+                languages, methods, subjects)
 
-        # Per-subject breakdown requires subject-level energy records
-        # (populated if run_experiment.py was run with subject tracking)
-        results_by_subject = make_simulated_subject_results(languages, methods, subjects)
+    # Only plot languages actually present in the results (supports partial runs).
+    languages = [l for l in languages if l in results]
+    if not languages:
+        raise SystemExit("No known languages found in results.")
 
     print("\nGenerating plots...")
     plot_accuracy_bars(results, languages, methods, out_dir)

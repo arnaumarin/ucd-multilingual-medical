@@ -18,7 +18,17 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from ucd_engine import UCDConfig, format_mc_prompt, predict_mc
+from ucd_engine import (
+    UCDConfig, format_mc_prompt, evaluate_mc_sample, get_answer_token_ids,
+)
+
+
+def pick_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -57,6 +67,10 @@ MODEL_CONFIGS = {
         "expert": "Qwen/Qwen2.5-1.5B-Instruct",
         "base":   "Qwen/Qwen2.5-1.5B",
     },
+    "7B": {
+        "expert": "Qwen/Qwen2.5-7B-Instruct",
+        "base":   "Qwen/Qwen2.5-7B",
+    },
 }
 
 
@@ -93,11 +107,20 @@ def load_mmmlu_medical(lang_code: str, mmmlu_config: str, n_samples: int) -> lis
                 })
 
     if n_samples and n_samples < len(rows):
-        # Stratified sample across subjects
-        import random
+        # Stratified sample: take an equal number per subject so every medical
+        # subject is represented (not just a random slice of the pooled rows).
+        import random, math
         random.seed(42)
-        random.shuffle(rows)
-        rows = rows[:n_samples]
+        per_subj = math.ceil(n_samples / len(MEDICAL_SUBJECTS))
+        by_subj: dict[str, list] = {}
+        for r in rows:
+            by_subj.setdefault(r["subject"], []).append(r)
+        sampled = []
+        for subj_rows in by_subj.values():
+            random.shuffle(subj_rows)
+            sampled.extend(subj_rows[:per_subj])
+        random.shuffle(sampled)
+        rows = sampled[:n_samples]
 
     return rows
 
@@ -106,13 +129,13 @@ def load_mmmlu_medical(lang_code: str, mmmlu_config: str, n_samples: int) -> lis
 # Model loading helpers
 # ---------------------------------------------------------------------------
 
-def load_model(model_name: str, device: str = "cpu"):
-    """Load model and tokenizer. Uses float32 on CPU (M1 compatible)."""
+def load_model(model_name: str, device: str = "cpu", dtype=torch.float32):
+    """Load model and tokenizer. bf16 on CUDA, fp32 on CPU/MPS."""
     print(f"  Loading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,
+        dtype=dtype,
         device_map=device,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
@@ -133,29 +156,30 @@ def evaluate_language(
     tokenizer,
     config: UCDConfig,
     methods: list[str],
+    answer_ids: dict,
 ) -> dict:
-    """Run all methods on a language's samples. Returns per-method accuracy + energy stats."""
+    """Run all methods on a language's samples in a single pair of forward passes
+    per sample. Returns per-method accuracy + per-sample energy records."""
     results = {m: {"correct": 0, "total": 0, "energies": []} for m in methods}
 
     for item in tqdm(samples, desc=f"  {lang_code}", leave=False):
         prompt = format_mc_prompt(item["question"], item["choices"], lang_code)
-        gold = item["answer"]
+        r = evaluate_mc_sample(
+            expert_model, base_model, tokenizer, prompt,
+            item["answer"], config, answer_ids,
+        )
 
         for method in methods:
-            pred_result = predict_mc(
-                expert_model, base_model, tokenizer, prompt, config, method=method
-            )
-            is_correct = pred_result["predicted"] == gold
+            is_correct = r[f"{method}_ok"]
             results[method]["correct"] += int(is_correct)
             results[method]["total"] += 1
-            if pred_result["exp_energy"] is not None:
-                results[method]["energies"].append({
-                    "exp":  pred_result["exp_energy"],
-                    "base": pred_result["base_energy"],
-                    "lang": lang_code,
-                    "subject": item["subject"],
-                    "correct": is_correct,
-                })
+            results[method]["energies"].append({
+                "exp":     r["exp_energy"],
+                "base":    r["base_energy"],
+                "lang":    lang_code,
+                "subject": item["subject"],
+                "correct": is_correct,
+            })
 
     for method in methods:
         n = results[method]["total"]
@@ -170,7 +194,7 @@ def evaluate_language(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_size", default="0.5B", choices=["0.5B", "1.5B"])
+    parser.add_argument("--model_size", default="0.5B", choices=["0.5B", "1.5B", "7B"])
     parser.add_argument("--n_samples", type=int, default=200,
                         help="Samples per language (0 = all)")
     parser.add_argument("--output_dir", default="../results")
@@ -186,14 +210,17 @@ def main():
 
     config = UCDConfig(beta=args.beta, temperature=args.temperature)
     model_cfg = MODEL_CONFIGS[args.model_size]
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Device: {device}")
+    device = pick_device()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    print(f"Device: {device} | dtype: {dtype}")
 
     print(f"\nLoading expert model: {model_cfg['expert']}")
-    expert_model, tokenizer = load_model(model_cfg["expert"], device)
+    expert_model, tokenizer = load_model(model_cfg["expert"], device, dtype)
 
     print(f"Loading base model: {model_cfg['base']}")
-    base_model, _ = load_model(model_cfg["base"], device)
+    base_model, _ = load_model(model_cfg["base"], device, dtype)
+
+    answer_ids = get_answer_token_ids(tokenizer)
 
     all_results = {}
     all_energy_records = []
@@ -207,7 +234,7 @@ def main():
         start = time.time()
         lang_results = evaluate_language(
             lang_code, samples, expert_model, base_model,
-            tokenizer, config, args.methods,
+            tokenizer, config, args.methods, answer_ids,
         )
         elapsed = time.time() - start
 

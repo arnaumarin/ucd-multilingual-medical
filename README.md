@@ -36,9 +36,28 @@ This repository tests whether UCD's **energy-based dynamic weighting** generalis
 
 ---
 
-## Core Hypothesis
+## Core Hypothesis (tested — **not supported for MC**)
 
 > UCD's uncertainty-aware weighting provides **larger accuracy gains in lower-resource languages**, where baseline models carry higher cumulative uncertainty — making it especially valuable for multilingual medical AI.
+
+**What we found:** on single-step multiple-choice, this does not hold. Across four expert/base pairings (scale, capability gap, and a true medical domain gap), **greedy decoding beats both CD and UCD**, and UCD ≈ CD throughout. See [Results](#results-tldr) and the full writeup in **[RESULTS.md](RESULTS.md)**.
+
+---
+
+## Results (TL;DR)
+
+Accuracy averaged over 8 languages, 150 stratified MMMLU-Medical samples/language (n = 1,200/pairing):
+
+| Pairing (expert + base) | Greedy | CD | UCD | UCD−Greedy | corr(E_exp,E_base) |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct + 0.5B | **0.316** | 0.302 | 0.303 | −0.013 | 0.999 |
+| Qwen2.5-7B-Instruct + 0.5B *(capability gap)* | **0.671** | 0.670 | 0.669 | −0.002 | 0.988 |
+| Qwen2.5-7B-Instruct + 7B | **0.671** | 0.665 | 0.665 | −0.006 | 0.999 |
+| Apollo2-7B + Qwen2.5-7B *(domain gap)* | **0.643** | 0.583 | 0.584 | **−0.058** | 0.989 |
+
+**Takeaways:** (1) greedy wins in every regime; (2) UCD's dynamic weighting adds nothing over static CD; (3) when the contrast is genuinely "live" (de-correlated energies — the capability and domain gaps), it still doesn't help, and the **domain gap hurts ~6 points**. Mechanistically, CD/UCD is a *generation-time* technique (multi-token repetition/hallucination control) that does not transfer to single-token MC answer selection. Full analysis, per-language tables, the β-sweep, and the mechanism: **[RESULTS.md](RESULTS.md)**.
+
+Real figures per pairing live in `plots/<tag>/` (e.g. `plots/apollo2_qwen7b/fig1_accuracy_bars.png`).
 
 ---
 
@@ -51,9 +70,16 @@ ucd-multilingual/
 │
 ├── scripts/
 │   ├── ucd_engine.py                   # UCD implementation (energy, logit trace, weighting)
-│   ├── run_fast.py                     # Main experiment runner (all languages × methods)
+│   ├── run_fast.py                     # Main runner — parametrized (--expert/--base/--tag)
 │   ├── run_experiment.py               # Full configurable runner (argparse, cloud-ready)
-│   └── generate_plots.py               # All paper figures + LaTeX table
+│   ├── sweep_beta.py                   # β-sweep (weight variance vs accuracy)
+│   ├── compare_pairings.py             # Cross-pairing comparison + energy diagnostics
+│   └── generate_plots.py               # All figures + LaTeX table (real or simulated)
+│
+├── tests/
+│   └── test_ucd_engine.py              # Numerical correctness tests (eq. 2–5, vocab align)
+│
+├── RESULTS.md                          # Full findings writeup (the negative result)
 │
 ├── configs/
 │   └── experiment_0.5B.yaml            # Reproducibility config for 0.5B run
@@ -74,9 +100,9 @@ ucd-multilingual/
 
 ---
 
-## Figures (Preview — Simulated Data)
+## Figures
 
-> Real results populate after running the experiment. These previews confirm layout and hypotheses.
+> **Real figures** from the experiments are in `plots/<tag>/` (one set per pairing — e.g. `plots/apollo2_qwen7b/`, `plots/7Bexp_7Bbase/`). The previews below in `plots/preview/` use **simulated** data and only confirm layout; they predate the real runs and do **not** reflect the findings — see [RESULTS.md](RESULTS.md) for actual results.
 
 ### Fig 1 — Accuracy across languages
 ![Fig 1](plots/preview/fig1_accuracy_bars.png)
@@ -163,11 +189,14 @@ This extension applies UCD to **multilingual multiple-choice evaluation** by sco
 - [x] Small-scale runner (0.5B, MPS/CPU)
 - [x] Full-scale runner (7B, cloud-ready)
 - [x] Plot generation (5 figures + LaTeX table)
-- [ ] Run 0.5B experiments (local)
-- [ ] Run 7B experiments (cloud)
+- [x] Run 0.5B experiments — greedy 0.316 / CD 0.302 / UCD 0.303
+- [x] Run 7B experiments — greedy 0.671 / CD 0.665 / UCD 0.665 (7B+7B)
+- [x] Capability-gap pairing (7B-Instruct + 0.5B) and **domain-gap** pairing (Apollo2-7B + Qwen2.5-7B)
+- [x] β-sweep + energy-correlation analysis across pairings ([RESULTS.md](RESULTS.md))
+- [x] Engine correctness tests (`tests/test_ucd_engine.py`, 8 passing)
+- [x] **Generation-mode** scoring (multi-token, MC2/MC3-style) — CD flips to mildly helpful; UCD still no reliable gain ([RESULTS.md §6](RESULTS.md))
 - [ ] MedQA EN/ZH comparison (USMLE format)
 - [ ] HEAD-QA Spanish analysis
-- [ ] Energy calibration analysis across languages
 
 ---
 

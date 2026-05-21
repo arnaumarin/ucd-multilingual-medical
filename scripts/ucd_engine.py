@@ -33,12 +33,34 @@ def format_mc_prompt(question: str, choices: list[str], language: str = "en") ->
         "es":    "Pregunta: {q}\nA. {a}\nB. {b}\nC. {c}\nD. {d}\nRespuesta:",
         "fr":    "Question : {q}\nA. {a}\nB. {b}\nC. {c}\nD. {d}\nRéponse :",
         "de":    "Frage: {q}\nA. {a}\nB. {b}\nC. {c}\nD. {d}\nAntwort:",
-        "ar":    "السؤال: {q}\nأ. {a}\nب. {b}\nج. {c}\nد. {d}\nالإجابة:",
+        # Latin A/B/C/D markers for all languages: MMMLU gold labels are Latin
+        # ("A".."D"), and keeping the option markers Latin makes the scored answer
+        # token consistent across languages. Only the lead words are translated.
+        "ar":    "السؤال: {q}\nA. {a}\nB. {b}\nC. {c}\nD. {d}\nالإجابة:",
         "ko":    "질문: {q}\nA. {a}\nB. {b}\nC. {c}\nD. {d}\n답변:",
         "ja":    "質問: {q}\nA. {a}\nB. {b}\nC. {c}\nD. {d}\n答え:",
     }.get(language, "Question: {q}\nA. {a}\nB. {b}\nC. {c}\nD. {d}\nAnswer:")
 
     return prefix.format(q=question, a=choices[0], b=choices[1], c=choices[2], d=choices[3])
+
+
+CLOZE_LEAD = {
+    "en": "Question: {q}\nAnswer:",
+    "zh": "问题：{q}\n答案：",
+    "es": "Pregunta: {q}\nRespuesta:",
+    "fr": "Question : {q}\nRéponse :",
+    "de": "Frage: {q}\nAntwort:",
+    "ar": "السؤال: {q}\nالإجابة:",
+    "ko": "질문: {q}\n답변:",
+    "ja": "質問: {q}\n答え:",
+}
+
+
+def format_cloze_context(question: str, language: str = "en") -> str:
+    """Context for generation-mode scoring: the question + an 'Answer:' cue, with
+    NO listed options. Each answer choice's full TEXT is then scored as the
+    continuation (MC2/MC3-style cloze)."""
+    return CLOZE_LEAD.get(language, CLOZE_LEAD["en"]).format(q=question)
 
 
 def compute_logit_trace(
@@ -58,7 +80,9 @@ def compute_logit_trace(
     input_ids = input_ids.to(next(model.parameters()).device)
     with torch.no_grad():
         outputs = model(input_ids, output_hidden_states=False)
-        all_logits = outputs.logits  # [1, seq_len, vocab_size]
+        # Cast to fp32 so energy (logsumexp) and trace accumulation are numerically
+        # stable even when the model runs in bf16/fp16 on GPU.
+        all_logits = outputs.logits.float()  # [1, seq_len, vocab_size]
 
     seq_len = all_logits.shape[1]
 
@@ -72,6 +96,20 @@ def compute_logit_trace(
 
     final_logits = all_logits[0, -1, :]  # logits at answer position
     return final_logits, logit_trace
+
+
+def align_vocab(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align two logit vectors to a common width.
+
+    Qwen2.5 model sizes pad the lm_head differently (e.g. 0.5B -> 151936,
+    7B -> 152064) even though the BPE tokenizer/vocab is shared. The extra rows
+    are unused padding tokens, so truncating both to min(width) lets the contrast
+    operate over identical token ids without losing any real (or answer) token.
+    """
+    if a.shape[0] != b.shape[0]:
+        v = min(a.shape[0], b.shape[0])
+        return a[:v], b[:v]
+    return a, b
 
 
 def compute_energy(logits: torch.Tensor, logit_trace: float, temperature: float) -> float:
@@ -89,39 +127,60 @@ def ucd_score(
     base_logits: torch.Tensor,
     expert_energy: float,
     base_energy: float,
-    alpha: float,
+    alpha: float = 1.0,
 ) -> torch.Tensor:
     """
     UCD logit vector (eq. 4 from paper):
-      z_UCD[v] = 2 * w_EXP * z_EXP[v] - w_BASE * z_BASE[v]
+      z_UCD[v] = (1 + alpha) * w_EXP * z_EXP[v] - w_BASE * z_BASE[v]
 
-    Weights are energy-normalized, applied only when both energies > 0.
+    The paper's eq. 4 fixes the expert coefficient at 2, which is the alpha=1
+    case here; alpha generalizes the expert/base contrast strength.
+
+    Per paper §3.2.1, models are combined only when BOTH energies are positive
+    (a negative energy signals the model is highly uncertain). Otherwise we fall
+    back to expert-only — which preserves the expert's argmax for MC scoring.
     """
-    total_energy = expert_energy + base_energy
-    if total_energy <= 0 or expert_energy <= 0:
-        # Fall back to expert-only when uncertain (paper §3.2.2)
+    if expert_energy <= 0 or base_energy <= 0:
         return expert_logits
 
+    total_energy = expert_energy + base_energy
     w_exp = expert_energy / total_energy
     w_base = base_energy / total_energy
-    return 2 * w_exp * expert_logits - w_base * base_logits
+    return (1 + alpha) * w_exp * expert_logits - w_base * base_logits
 
 
-def get_answer_token_ids(tokenizer) -> dict[str, int]:
+def get_answer_token_ids(tokenizer) -> dict[str, dict[str, int]]:
     """
-    Get token IDs for answer letters A/B/C/D.
-    Handles tokenizers that prepend a space.
+    For each answer letter A/B/C/D, return BOTH surface-form token IDs:
+      - "bare":  the letter with no leading space (e.g. "A")
+      - "space": the letter with a leading space (e.g. " A")
+
+    Which form the model actually emits depends on the prompt: after a half-width
+    colon ("Answer:") most tokenizers (LLaMA/Qwen) emit a space-prefixed " A",
+    whereas after a full-width CJK colon ("答案：") they emit a bare "A". We keep
+    both and let decide_answer_form() pick the right one per prompt.
     """
     ids = {}
     for letter in ANSWER_CHOICES:
-        # Try plain letter first, then space-prefixed (common in LLaMA/Qwen tokenizers)
-        tok_id = tokenizer.encode(letter, add_special_tokens=False)
-        if len(tok_id) == 1:
-            ids[letter] = tok_id[0]
-        else:
-            tok_id = tokenizer.encode(" " + letter, add_special_tokens=False)
-            ids[letter] = tok_id[-1]
+        bare = tokenizer.encode(letter, add_special_tokens=False)
+        space = tokenizer.encode(" " + letter, add_special_tokens=False)
+        ids[letter] = {"bare": bare[-1], "space": space[-1]}
     return ids
+
+
+def decide_answer_form(expert_logits: torch.Tensor, answer_ids: dict) -> tuple[dict, str]:
+    """
+    Decide whether the model emits bare or space-prefixed answer letters at this
+    position, by comparing the total logit mass the EXPERT assigns to each form
+    across A/B/C/D. The chosen token IDs are then used to score ALL methods
+    (greedy/CD/UCD), keeping comparisons fair.
+
+    Returns ({letter: token_id}, form_name).
+    """
+    space_total = sum(float(expert_logits[answer_ids[L]["space"]]) for L in ANSWER_CHOICES)
+    bare_total = sum(float(expert_logits[answer_ids[L]["bare"]]) for L in ANSWER_CHOICES)
+    form = "space" if space_total >= bare_total else "bare"
+    return {L: answer_ids[L][form] for L in ANSWER_CHOICES}, form
 
 
 def predict_mc(
@@ -146,8 +205,11 @@ def predict_mc(
     )
     exp_energy = compute_energy(exp_logits, exp_trace, config.temperature)
 
+    # Pick the answer surface form (bare vs space-prefixed) from the expert.
+    chosen, _ = decide_answer_form(exp_logits, answer_ids)
+
     if method == "greedy":
-        choice_logits = {ch: exp_logits[tid].item() for ch, tid in answer_ids.items()}
+        choice_logits = {ch: exp_logits[tid].item() for ch, tid in chosen.items()}
         predicted = max(choice_logits, key=choice_logits.get)
         return {
             "predicted": predicted,
@@ -160,15 +222,19 @@ def predict_mc(
     base_logits, base_trace = compute_logit_trace(
         base_model, tokenizer, input_ids, config.beta, config.temperature
     )
+    # Align vocab widths (different model sizes pad the lm_head differently),
+    # then recompute the expert energy over the shared vocab for comparability.
+    exp_logits, base_logits = align_vocab(exp_logits, base_logits)
+    exp_energy = compute_energy(exp_logits, exp_trace, config.temperature)
     base_energy = compute_energy(base_logits, base_trace, config.temperature)
 
     if method == "cd":
         # Standard contrastive decoding: static equal weighting
         cd_logits = 2 * exp_logits - base_logits
-        choice_logits = {ch: cd_logits[tid].item() for ch, tid in answer_ids.items()}
+        choice_logits = {ch: cd_logits[tid].item() for ch, tid in chosen.items()}
     else:  # ucd
         ucd_logits = ucd_score(exp_logits, base_logits, exp_energy, base_energy, config.alpha)
-        choice_logits = {ch: ucd_logits[tid].item() for ch, tid in answer_ids.items()}
+        choice_logits = {ch: ucd_logits[tid].item() for ch, tid in chosen.items()}
 
     predicted = max(choice_logits, key=choice_logits.get)
     return {
@@ -177,3 +243,136 @@ def predict_mc(
         "exp_energy": exp_energy,
         "base_energy": base_energy,
     }
+
+
+def evaluate_mc_sample(
+    expert_model,
+    base_model,
+    tokenizer,
+    prompt: str,
+    gold: str,
+    config: UCDConfig,
+    answer_ids: dict,
+) -> dict:
+    """
+    Evaluate greedy / CD / UCD on a single MC question in ONE pair of forward
+    passes (one expert, one base). All three methods are scored on the same
+    answer tokens, chosen per-prompt via decide_answer_form().
+
+    This is the shared core used by both experiment runners so the engine and
+    runners can never drift apart.
+    """
+    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+
+    exp_logits, exp_trace = compute_logit_trace(
+        expert_model, tokenizer, input_ids, config.beta, config.temperature)
+    base_logits, base_trace = compute_logit_trace(
+        base_model, tokenizer, input_ids, config.beta, config.temperature)
+
+    # Align vocab widths so the contrast operates over identical token ids
+    # (different model sizes pad the lm_head differently).
+    exp_logits, base_logits = align_vocab(exp_logits, base_logits)
+
+    exp_energy = compute_energy(exp_logits, exp_trace, config.temperature)
+    base_energy = compute_energy(base_logits, base_trace, config.temperature)
+
+    chosen, form = decide_answer_form(exp_logits, answer_ids)
+
+    ucd_logits = ucd_score(exp_logits, base_logits, exp_energy, base_energy, config.alpha)
+    cd_logits = 2 * exp_logits - base_logits  # static-weight contrastive decoding
+
+    def pick(vec):
+        scores = {ch: vec[tid].item() for ch, tid in chosen.items()}
+        return max(scores, key=scores.get), scores
+
+    greedy_pred, greedy_scores = pick(exp_logits)
+    cd_pred, cd_scores = pick(cd_logits)
+    ucd_pred, ucd_scores = pick(ucd_logits)
+
+    return {
+        "gold":          gold,
+        "greedy_pred":   greedy_pred,
+        "cd_pred":       cd_pred,
+        "ucd_pred":      ucd_pred,
+        "greedy_ok":     greedy_pred == gold,
+        "cd_ok":         cd_pred == gold,
+        "ucd_ok":        ucd_pred == gold,
+        "exp_energy":    exp_energy,
+        "base_energy":   base_energy,
+        "exp_trace":     float(exp_trace),
+        "base_trace":    float(base_trace),
+        "answer_form":   form,
+        "greedy_scores": greedy_scores,
+        "cd_scores":     cd_scores,
+        "ucd_scores":    ucd_scores,
+    }
+
+
+# ── Generation-mode (multi-token / cloze) scoring ────────────────────────────
+def _seq_logprobs(model, tokenizer, ctx_ids, cont_ids):
+    """Forward `ctx_ids + cont_ids` once; return (cont_logit_rows, lse_rows) where
+    cont_logit_rows[i] is the full fp32 logit vector predicting continuation token i."""
+    full = torch.tensor([ctx_ids + cont_ids], device=next(model.parameters()).device)
+    with torch.no_grad():
+        logits = model(full).logits[0].float()       # [L, V]
+    n_ctx = len(ctx_ids)
+    # logits[n_ctx-1+i] predicts cont_ids[i]
+    rows = logits[n_ctx - 1: n_ctx - 1 + len(cont_ids)]   # [len(cont), V]
+    return rows
+
+
+def score_answer_text_generation(
+    expert_model, base_model, tokenizer, context: str, choices: list[str],
+    config: UCDConfig,
+) -> tuple[dict, dict]:
+    """
+    Generation-mode scoring: score each answer-choice TEXT as a multi-token
+    continuation of `context`, under greedy / CD / UCD. This is the regime CD/UCD
+    were designed for — the logit trace accumulates over the continuation tokens
+    and the energy-based weight is recomputed at every token.
+
+    For each choice we sum per-token log-probabilities (length-normalized) of the
+    choice text, then pick the choice with the highest mean log-prob per method.
+
+    Returns ({method: predicted_index}, {method: [per-choice mean logprob]}).
+    """
+    ctx_ids = tokenizer.encode(context, add_special_tokens=True)
+    methods = ["greedy", "cd", "ucd"]
+    scores = {m: [] for m in methods}
+
+    for choice in choices:
+        cont_ids = tokenizer.encode(" " + choice, add_special_tokens=False)
+        if not cont_ids:
+            for m in methods:
+                scores[m].append(-1e9)
+            continue
+
+        exp_rows = _seq_logprobs(expert_model, tokenizer, ctx_ids, cont_ids)
+        base_rows = _seq_logprobs(base_model, tokenizer, ctx_ids, cont_ids)
+
+        lp = {m: 0.0 for m in methods}
+        trace_e = 0.0
+        trace_b = 0.0
+        T = config.temperature
+        for i, tok in enumerate(cont_ids):
+            ze, zb = align_vocab(exp_rows[i], base_rows[i])
+
+            lp["greedy"] += torch.log_softmax(ze, dim=0)[tok].item()
+            lp["cd"] += torch.log_softmax(2 * ze - zb, dim=0)[tok].item()
+
+            # per-token energy with the trace over the continuation so far
+            Ee = T * torch.logsumexp((ze + trace_e) / T, dim=0).item()
+            Eb = T * torch.logsumexp((zb + trace_b) / T, dim=0).item()
+            ucd_logits = ucd_score(ze, zb, Ee, Eb, config.alpha)
+            lp["ucd"] += torch.log_softmax(ucd_logits, dim=0)[tok].item()
+
+            # advance traces with the logit each model assigned to the chosen token
+            trace_e = config.beta * trace_e + ze[tok].item()
+            trace_b = config.beta * trace_b + zb[tok].item()
+
+        n = len(cont_ids)
+        for m in methods:
+            scores[m].append(lp[m] / n)   # length-normalized mean log-prob
+
+    preds = {m: int(max(range(len(choices)), key=lambda j: scores[m][j])) for m in methods}
+    return preds, scores
