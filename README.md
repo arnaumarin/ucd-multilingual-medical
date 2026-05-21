@@ -46,16 +46,16 @@ This repository tests whether UCD's **energy-based dynamic weighting** generalis
 
 ## Results (TL;DR)
 
-Accuracy averaged over 8 languages, 150 stratified MMMLU-Medical samples/language (n = 1,200/pairing):
+Single-step MC accuracy averaged over 8 languages, **500 stratified MMMLU-Medical samples/language (n = 4,000/pairing)**. `*` = 95 % paired-bootstrap CI excludes 0.
 
 | Pairing (expert + base) | Greedy | CD | UCD | UCD−Greedy | corr(E_exp,E_base) |
 |---|---|---|---|---|---|
-| Qwen2.5-0.5B-Instruct + 0.5B | **0.316** | 0.302 | 0.303 | −0.013 | 0.999 |
-| Qwen2.5-7B-Instruct + 0.5B *(capability gap)* | **0.671** | 0.670 | 0.669 | −0.002 | 0.988 |
-| Qwen2.5-7B-Instruct + 7B | **0.671** | 0.665 | 0.665 | −0.006 | 0.999 |
-| Apollo2-7B + Qwen2.5-7B *(domain gap)* | **0.643** | 0.583 | 0.584 | **−0.058** | 0.989 |
+| Qwen2.5-0.5B-Instruct + 0.5B | **0.344** | 0.328 | 0.330 | −0.015\* | 0.999 |
+| Qwen2.5-7B-Instruct + 0.5B *(capability gap)* | **0.661** | 0.661 | 0.661 | −0.001 | 0.992 |
+| Qwen2.5-7B-Instruct + 7B | **0.661** | 0.652 | 0.653 | −0.009\* | 1.000 |
+| Apollo2-7B + Qwen2.5-7B *(domain gap)* | **0.645** | 0.581 | 0.583 | **−0.061\*** | 0.989 |
 
-**Takeaways:** (1) greedy wins in every regime; (2) UCD's dynamic weighting adds nothing over static CD; (3) when the contrast is genuinely "live" (de-correlated energies — the capability and domain gaps), it still doesn't help, and the **domain gap hurts ~6 points**. Mechanistically, CD/UCD is a *generation-time* technique (multi-token repetition/hallucination control) that does not transfer to single-token MC answer selection. Full analysis, per-language tables, the β-sweep, and the mechanism: **[RESULTS.md](RESULTS.md)**.
+**Takeaways:** (1) greedy wins in every regime (significantly in 3 of 4); (2) UCD's dynamic weighting adds nothing over static CD; (3) the contrast *significantly hurts* where it's genuinely "live," and the **medical domain gap hurts most (−0.061)**. A multi-token **generation-mode** follow-up ([RESULTS.md §6](RESULTS.md)) finds the contrast is *less harmful* there (consistent with CD being a generation-time mechanism) but still not beneficial; a CD "flip to helpful" seen in an n=150 pilot did not survive at n=500. Mechanistically, CD/UCD is a generation-time technique that does not transfer to single-token MC answer selection. Full analysis, per-language tables, β-sweep, and significance: **[RESULTS.md](RESULTS.md)**.
 
 Real figures per pairing live in `plots/<tag>/` (e.g. `plots/apollo2_qwen7b/fig1_accuracy_bars.png`).
 
@@ -189,12 +189,11 @@ This extension applies UCD to **multilingual multiple-choice evaluation** by sco
 - [x] Small-scale runner (0.5B, MPS/CPU)
 - [x] Full-scale runner (7B, cloud-ready)
 - [x] Plot generation (5 figures + LaTeX table)
-- [x] Run 0.5B experiments — greedy 0.316 / CD 0.302 / UCD 0.303
-- [x] Run 7B experiments — greedy 0.671 / CD 0.665 / UCD 0.665 (7B+7B)
+- [x] Run experiments at n=500/lang — greedy 0.344 / CD 0.328 / UCD 0.330 (0.5B); 0.661 / 0.652 / 0.653 (7B+7B)
 - [x] Capability-gap pairing (7B-Instruct + 0.5B) and **domain-gap** pairing (Apollo2-7B + Qwen2.5-7B)
 - [x] β-sweep + energy-correlation analysis across pairings ([RESULTS.md](RESULTS.md))
 - [x] Engine correctness tests (`tests/test_ucd_engine.py`, 8 passing)
-- [x] **Generation-mode** scoring (multi-token, MC2/MC3-style) — CD flips to mildly helpful; UCD still no reliable gain ([RESULTS.md §6](RESULTS.md))
+- [x] **Generation-mode** scoring (multi-token, MC2/MC3-style) — contrast less harmful but not helpful; UCD no reliable gain ([RESULTS.md §6](RESULTS.md))
 - [ ] MedQA EN/ZH comparison (USMLE format)
 - [ ] HEAD-QA Spanish analysis
 

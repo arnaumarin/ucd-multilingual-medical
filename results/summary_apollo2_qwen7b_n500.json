@@ -1,0 +1,46 @@
+{
+  "expert": "FreedomIntelligence/Apollo2-7B",
+  "base": "Qwen/Qwen2.5-7B",
+  "summary": {
+    "en": {
+      "greedy": 0.724,
+      "cd": 0.668,
+      "ucd": 0.658
+    },
+    "zh": {
+      "greedy": 0.696,
+      "cd": 0.644,
+      "ucd": 0.638
+    },
+    "es": {
+      "greedy": 0.688,
+      "cd": 0.634,
+      "ucd": 0.64
+    },
+    "fr": {
+      "greedy": 0.684,
+      "cd": 0.574,
+      "ucd": 0.58
+    },
+    "de": {
+      "greedy": 0.646,
+      "cd": 0.592,
+      "ucd": 0.594
+    },
+    "ar": {
+      "greedy": 0.524,
+      "cd": 0.46,
+      "ucd": 0.472
+    },
+    "ko": {
+      "greedy": 0.546,
+      "cd": 0.48,
+      "ucd": 0.482
+    },
+    "ja": {
+      "greedy": 0.652,
+      "cd": 0.598,
+      "ucd": 0.604
+    }
+  }
+}

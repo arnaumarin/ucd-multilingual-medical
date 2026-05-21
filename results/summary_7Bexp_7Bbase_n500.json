@@ -1,0 +1,46 @@
+{
+  "expert": "Qwen/Qwen2.5-7B-Instruct",
+  "base": "Qwen/Qwen2.5-7B",
+  "summary": {
+    "en": {
+      "greedy": 0.75,
+      "cd": 0.742,
+      "ucd": 0.742
+    },
+    "zh": {
+      "greedy": 0.75,
+      "cd": 0.73,
+      "ucd": 0.734
+    },
+    "es": {
+      "greedy": 0.68,
+      "cd": 0.678,
+      "ucd": 0.676
+    },
+    "fr": {
+      "greedy": 0.688,
+      "cd": 0.682,
+      "ucd": 0.68
+    },
+    "de": {
+      "greedy": 0.68,
+      "cd": 0.658,
+      "ucd": 0.658
+    },
+    "ar": {
+      "greedy": 0.538,
+      "cd": 0.54,
+      "ucd": 0.542
+    },
+    "ko": {
+      "greedy": 0.55,
+      "cd": 0.536,
+      "ucd": 0.538
+    },
+    "ja": {
+      "greedy": 0.656,
+      "cd": 0.65,
+      "ucd": 0.65
+    }
+  }
+}

@@ -79,22 +79,23 @@ def compute_logit_trace(
     """
     input_ids = input_ids.to(next(model.parameters()).device)
     with torch.no_grad():
-        outputs = model(input_ids, output_hidden_states=False)
-        # Cast to fp32 so energy (logsumexp) and trace accumulation are numerically
-        # stable even when the model runs in bf16/fp16 on GPU.
-        all_logits = outputs.logits.float()  # [1, seq_len, vocab_size]
+        logits = model(input_ids).logits[0]  # [seq_len, vocab] (model dtype)
 
-    seq_len = all_logits.shape[1]
+    # Logit each model assigned to the actually-occurring next token, per position.
+    # Gather in model dtype, then cast just this [seq_len-1] vector to fp32 — avoids
+    # materializing a full [seq_len, vocab] fp32 copy (OOM on long prompts + 7B pairs).
+    sel = logits[:-1].gather(1, input_ids[0, 1:, None]).squeeze(1).float()  # [seq_len-1]
 
-    # Build cumulative logit trace over the sequence (eq. 2)
-    # l_t = beta * l_{t-1} + z_t[x_t]  where x_t is the actual token at position t
-    logit_trace = 0.0
-    for k in range(seq_len - 1):
-        token_id = input_ids[0, k + 1].item()   # token selected at step k+1
-        token_logit = all_logits[0, k, token_id].item()
-        logit_trace = beta * logit_trace + token_logit
+    # Cumulative logit trace (eq. 2): discounted sum with the most recent token
+    # weighted beta^0 = 1. Vectorized (no per-token host sync).
+    if beta == 1.0:
+        logit_trace = float(sel.sum())
+    else:
+        L = sel.shape[0]
+        powers = beta ** torch.arange(L - 1, -1, -1, device=sel.device, dtype=torch.float32)
+        logit_trace = float((sel * powers).sum())
 
-    final_logits = all_logits[0, -1, :]  # logits at answer position
+    final_logits = logits[-1].float()  # [vocab] at answer position
     return final_logits, logit_trace
 
 
@@ -310,15 +311,16 @@ def evaluate_mc_sample(
 
 # ── Generation-mode (multi-token / cloze) scoring ────────────────────────────
 def _seq_logprobs(model, tokenizer, ctx_ids, cont_ids):
-    """Forward `ctx_ids + cont_ids` once; return (cont_logit_rows, lse_rows) where
-    cont_logit_rows[i] is the full fp32 logit vector predicting continuation token i."""
+    """Forward `ctx_ids + cont_ids` once; return the fp32 logit rows that predict
+    each continuation token. Uses logits_to_keep so the lm_head only projects the
+    last few positions to vocab (avoids a full [L, vocab] tensor — OOM on 7B pairs
+    with long medical contexts)."""
     full = torch.tensor([ctx_ids + cont_ids], device=next(model.parameters()).device)
+    k = len(cont_ids) + 1  # last k positions = (n_ctx-1) .. (total-1)
     with torch.no_grad():
-        logits = model(full).logits[0].float()       # [L, V]
-    n_ctx = len(ctx_ids)
-    # logits[n_ctx-1+i] predicts cont_ids[i]
-    rows = logits[n_ctx - 1: n_ctx - 1 + len(cont_ids)]   # [len(cont), V]
-    return rows
+        logits = model(full, logits_to_keep=k).logits[0]   # [k, V] (model dtype)
+    # of those, positions 0..len(cont)-1 predict cont_ids[0..]; the last is unused
+    return logits[: len(cont_ids)].float()                 # [len(cont), V]
 
 
 def score_answer_text_generation(
